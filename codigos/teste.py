@@ -1,39 +1,35 @@
 #!/usr/bin/env python3.11
 """
-OpenShift Cost Management - Extrator de Dados
-VERSÃO FINAL - PQ MODE
-
-✔ Estrutura do Excel preservada
-✔ Abas preservadas
-✔ Correção baseada 100% no Power Query
-✔ OS Cost Cluster Projects OK
-✔ OS Cost Project Tags OK
-✔ OS Costs Daily OK (Table.Combine Projects/Clusters/Nodes/Tags)
+OpenShift Cost Management - OS Daily Usage (somente)
+✔ Gera APENAS a aba "OS Daily Usage"
+✔ Lógica baseada 100% no Power Query (combine Project/Cluster/Node/Tag)
+✔ Endpoints corretos (compute/memory/volumes) — evita 404 de /cpu/
+✔ Colunas e ordem iguais ao template OpenShift_Daily_Usage.xlsx
 """
 
 import os
 import sys
 import logging
+import argparse
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
-import argparse
 
-# ------------------------------------------------------------------------------
-# LOGGING
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# LOG
+# ---------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - __main__ - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # CONFIG
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 class APIConfig:
     def __init__(self):
         self.client_id = os.getenv("OPENSHIFT_CLIENT_ID", "")
@@ -47,50 +43,48 @@ class APIConfig:
         self.max_retries = 3
         self.backoff_factor = 0.5
 
-
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # API CLIENT
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 class OpenShiftCostAPIClient:
-    def __init__(self, config: APIConfig, logger):
+    def __init__(self, config: APIConfig, logger: logging.Logger):
         self.config = config
         self.logger = logger
-        self.access_token = None
-        self.token_expires_at = None
         self.session = self._create_session()
+        self.access_token: Optional[str] = None
+        self.token_expires_at: Optional[datetime] = None
 
     def _create_session(self) -> requests.Session:
-        session = requests.Session()
-        retry_strategy = Retry(
+        s = requests.Session()
+        retry = Retry(
             total=self.config.max_retries,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET", "POST"],
             backoff_factor=self.config.backoff_factor,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST", "HEAD", "OPTIONS"],
         )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
-        return session
+        s.mount("https://", HTTPAdapter(max_retries=retry))
+        s.mount("http://", HTTPAdapter(max_retries=retry))
+        return s
 
     def _get_token(self) -> str:
+        # Reusa token se ainda válido
         if self.access_token and self.token_expires_at and datetime.now() < self.token_expires_at:
             return self.access_token
 
         self.logger.info("Obtendo novo access token...")
-        auth_data = {
-            "grant_type": "client_credentials",
-            "client_id": self.config.client_id,
-            "client_secret": self.config.client_secret,
-        }
         resp = self.session.post(
             self.config.auth_url,
-            data=auth_data,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": self.config.client_id,
+                "client_secret": self.config.client_secret,
+            },
             timeout=self.config.timeout,
         )
         resp.raise_for_status()
-        token_response = resp.json()
-        self.access_token = token_response["access_token"]
-        expires_in = token_response.get("expires_in", 900)
+        data = resp.json()
+        self.access_token = data["access_token"]
+        expires_in = int(data.get("expires_in", 900))
         self.token_expires_at = datetime.now() + timedelta(seconds=expires_in - 60)
         self.logger.info("Token obtido com sucesso")
         return self.access_token
@@ -99,670 +93,415 @@ class OpenShiftCostAPIClient:
         return {
             "Authorization": f"Bearer {self._get_token()}",
             "Accept": "application/json",
-            "Content-Type": "application/json",
         }
 
-    # --------------------------------------------------------------------------
-    # BASE: /reports/openshift/costs (group_by)
-    # --------------------------------------------------------------------------
-    def get_costs_by_groupby(self, start_date: str, end_date: str, currency: str = "BRL") -> Dict[str, Any]:
-        all_data: Dict[str, Any] = {}
-
-        group_by_configs = [
-            {"type": "cluster", "params": {"group_by[cluster]": "*"}},
-            {"type": "node", "params": {"group_by[cluster]": "*", "group_by[node]": "*"}},
-            {"type": "project", "params": {"group_by[project]": "*"}},
-            {"type": "tag:produto", "params": {"group_by[tag:produto]": "*"}},
-        ]
-
-        for cfg in group_by_configs:
-            group_type = cfg["type"]
-            group_params = cfg["params"]
-
-            try:
-                self.logger.info(f"Buscando dados agrupados por {group_type}...")
-                all_items: List[Dict[str, Any]] = []
-                limit = 250
-                offset = 0
-                page = 1
-
-                while True:
-                    url = f"{self.config.api_base_url}/reports/openshift/costs/"
-                    params = {
-                        "currency": currency,
-                        "filter[limit]": limit,
-                        "filter[offset]": offset,
-                        "filter[resolution]": "daily",
-                        "start_date": start_date,
-                        "end_date": end_date,
-                        "order_by[cost]": "desc",
-                    }
-                    params.update(group_params)
-
-                    resp = self.session.get(
-                        url,
-                        params=params,
-                        headers=self._headers(),
-                        timeout=self.config.timeout,
-                    )
-                    resp.raise_for_status()
-                    payload = resp.json()
-
-                    items = payload.get("data", [])
-                    meta = payload.get("meta", {})
-
-                    if not items:
-                        break
-
-                    all_items.extend(items)
-
-                    count = meta.get("count", 0)
-                    offset_next = offset + limit
-
-                    if count <= offset_next:
-                        break
-
-                    offset = offset_next
-                    page += 1
-
-                # tag:produto → armazenar em all_data["tag"] e guardar nome da key
-                if "tag:" in group_type:
-                    tag_key_name = group_type.split(":", 1)[1]
-                    all_data["_tag_key_name"] = tag_key_name
-                    all_data.setdefault("tag", [])
-                    all_data["tag"].extend(all_items)
-                else:
-                    all_data.setdefault(group_type, [])
-                    all_data[group_type].extend(all_items)
-
-                self.logger.info(f"Obtidos {len(all_items)} registros para {group_type} ({page} paginas)")
-            except Exception as e:
-                self.logger.warning(f"Aviso: Falha ao obter dados para {group_type}: {e}")
-
-        for key in ["cluster", "node", "project", "tag"]:
-            all_data.setdefault(key, [])
-
-        return all_data
-
-    # --------------------------------------------------------------------------
-    # TAG KEYS
-    # --------------------------------------------------------------------------
-    def get_tags(self, limit: int = 1000) -> List[Dict[str, Any]]:
-        self.logger.info("Buscando dados de tags...")
+    def get_tag_keys(self, limit: int = 1000) -> List[str]:
+        """
+        Mesma fonte de keys do PQ (usa tags/openshift e extrai 'key').
+        """
         url = f"{self.config.api_base_url}/tags/openshift"
         resp = self.session.get(
             url,
-            params={"limit": limit},
             headers=self._headers(),
+            params={"limit": limit},
             timeout=self.config.timeout,
         )
         resp.raise_for_status()
-        tags = resp.json().get("data", [])
-        self.logger.info(f"Tags obtidas: {len(tags)}")
-        return tags
+        data = resp.json().get("data", [])
+        keys = []
+        for t in data:
+            k = t.get("key")
+            if k:
+                keys.append(k)
+        # fallback
+        return sorted(set(keys)) if keys else ["produto"]
 
-    # --------------------------------------------------------------------------
-    # POWER QUERY MODE - OS Cost Cluster Projects
-    # (já estava ok no seu fluxo)
-    # --------------------------------------------------------------------------
-    def get_cluster_project_costs(self, start_date: str, end_date: str, currency: str = "BRL") -> List[Dict[str, Any]]:
-        self.logger.info("Coletando dados Cluster x Project (Power Query mode)...")
+    def get_usage_report(
+        self,
+        usage_code: str,
+        start_date: str,
+        end_date: str,
+        group_by_code: str,
+        tag_key: Optional[str] = None,
+        limit: int = 200,
+    ) -> Dict[str, Any]:
+        """
+        Implementa o get_usage_loop_data do Power Query:
+        /reports/openshift/{usage_code}/?filter[limit]=...&filter[offset]=...&filter[resolution]=daily...
+        &group_by[project|cluster|node|tag:key]=*
+        """
+        url = f"{self.config.api_base_url}/reports/openshift/{usage_code}/"
 
-        cluster_data = self.get_costs_by_groupby(start_date, end_date, currency).get("cluster", [])
+        # monta o parâmetro group_by
+        if group_by_code == "tag":
+            if not tag_key:
+                raise ValueError("tag_key é obrigatório quando group_by_code='tag'")
+            group_by_param = {f"group_by[tag:{tag_key}]": "*"}
+        else:
+            group_by_param = {f"group_by[{group_by_code}]": "*"}
 
-        results: List[Dict[str, Any]] = []
-        seen: set = set()
+        all_items: List[Dict[str, Any]] = []
+        meta_first: Optional[Dict[str, Any]] = None
 
-        for item in cluster_data:
-            date = item.get("date")
-            month = pd.to_datetime(date).strftime("%Y-%m")
-
-            for cluster in item.get("clusters", []):
-                cluster_name = cluster.get("cluster")
-                if not cluster_name:
-                    continue
-
-                key = (cluster_name, month)
-                if key in seen:
-                    continue
-                seen.add(key)
-
-                offset = 0
-                limit = 200
-
-                while True:
-                    params = {
-                        "currency": currency,
-                        "filter[cluster]": cluster_name,
-                        "filter[resolution]": "daily",
-                        "filter[limit]": limit,
-                        "filter[offset]": offset,
-                        "start_date": start_date,
-                        "end_date": end_date,
-                        "group_by[project]": "*",
-                    }
-
-                    resp = self.session.get(
-                        f"{self.config.api_base_url}/reports/openshift/costs/",
-                        headers=self._headers(),
-                        params=params,
-                        timeout=self.config.timeout,
-                    )
-                    resp.raise_for_status()
-
-                    payload = resp.json()
-                    data = payload.get("data", [])
-                    meta = payload.get("meta", {})
-
-                    if not data:
-                        break
-
-                    for row in data:
-                        row["_cluster"] = cluster_name
-                        results.append(row)
-
-                    offset += limit
-                    if offset >= meta.get("count", 0):
-                        break
-
-        return results
-
-    # --------------------------------------------------------------------------
-    # POWER QUERY MODE - OS Cost Project Tags (por projeto)
-    # --------------------------------------------------------------------------
-    def get_project_tags_by_project(self, project: str, start_date: str, end_date: str) -> List[Dict[str, Any]]:
-        # Power Query: get_no_loop_data("?filter[project]=...&filter[resolution]=daily&start_date=...&end_date=...")
-        resp = self.session.get(
-            f"{self.config.api_base_url}/tags/openshift",
-            headers=self._headers(),
-            params={
-                "filter[project]": project,
+        offset = 0
+        while True:
+            params = {
+                "filter[limit]": limit,
+                "filter[offset]": offset,
                 "filter[resolution]": "daily",
                 "start_date": start_date,
                 "end_date": end_date,
-            },
-            timeout=self.config.timeout,
-        )
-        resp.raise_for_status()
-        return resp.json().get("data", [])
+            }
+            params.update(group_by_param)
 
+            resp = self.session.get(
+                url,
+                headers=self._headers(),
+                params=params,
+                timeout=self.config.timeout,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
 
-# ------------------------------------------------------------------------------
-# FORMATADOR EXCEL (estrutura preservada)
-# ------------------------------------------------------------------------------
-class ExcelFormatterFixed:
-    def __init__(self, logger, currency: str = "BRL"):
+            data = payload.get("data", []) or []
+            meta = payload.get("meta", {}) or {}
+            if meta_first is None:
+                meta_first = meta
+
+            if not data:
+                break
+
+            all_items.extend(data)
+
+            count = int(meta.get("count", 0) or 0)
+            offset += limit
+            if offset >= count:
+                break
+
+        return {
+            "meta": meta_first or {},
+            "data": all_items,
+        }
+
+# ---------------------------------------------------------------------
+# FORMATADOR: OS DAILY USAGE
+# ---------------------------------------------------------------------
+class ExcelDailyUsageFormatter:
+    def __init__(self, logger: logging.Logger, currency: str = "BRL"):
         self.logger = logger
         self.currency = currency
 
-    # --------------------------------------------------------------------------
-    # Helpers - flatten (igual PQ “Expanded values ... Expanded cost ...”)
-    # --------------------------------------------------------------------------
-    def _safe_join_csv(self, v: Any) -> str:
-        if isinstance(v, list):
-            return ",".join([str(x) for x in v])
-        return ""
+        # Ordem/colunas iguais ao template enviado (OpenShift_Daily_Usage.xlsx)
+        self.TEMPLATE_COLUMNS = [
+            "Group By",
+            "Group By Code",
+            "Usage Code",
+            "Usage Name",
+            "Key",
+            "meta.count",
+            "meta.currency",
+            "date",
+            "Name",
+            "values.usage.value",
+            "values.usage.units",
+            "values.request.value",
+            "values.request.units",
+            "values.request.unused",
+            "values.request.unused_percent",
+            "values.limit.value",
+            "values.limit.units",
+            "values.capacity.value",
+            "values.capacity.units",
+            "values.capacity.unused",
+            "values.capacity.unused_percent",
+            "values.capacity.count",
+            "values.capacity.count_units",
+        ]
 
-    def _flatten_values_record(
-        self,
-        values_record: Dict[str, Any],
-        group_by_code: str,
-        name: str,
-        date: str,
-        tag_key: Optional[str] = None,
-        delta_value_override: Optional[Any] = None,
-        delta_percent_override: Optional[Any] = None,
-    ) -> Dict[str, Any]:
-        """
-        Power Query:
-        Expand values → (values.date, classification, source_uuid, clusters, infrastructure, supplementary, cost, delta_*)
-        Expand infra/supp/cost subrecords
-        """
-        row: Dict[str, Any] = {
-            "code": self.currency,
-            "Group By Code": group_by_code,
-            "meta.distributed_overhead": True,  # PQ traz do extract; aqui mantemos compatível
-            "date": pd.to_datetime(date),
-            "Name": name,
-            "values.date": pd.to_datetime(values_record.get("date", date)),
-            "values.classification": values_record.get("classification", ""),
-            "values.source_uuid": self._safe_join_csv(values_record.get("source_uuid")),
-            "values.clusters": self._safe_join_csv(values_record.get("clusters")),
+        # mapping do teu template
+        self.USAGE_CODE_NAME = {
+            "compute": "CPU",
+            "memory": "Memory",
+            "volumes": "Volume Claims",
         }
 
-        # Infrastructure
-        infra = values_record.get("infrastructure", {}) or {}
-        row["values.infrastructure.raw.value"] = (infra.get("raw", {}) or {}).get("value", 0) or 0
-        row["values.infrastructure.raw.units"] = (infra.get("raw", {}) or {}).get("units", self.currency) or self.currency
-        row["values.infrastructure.markup.value"] = (infra.get("markup", {}) or {}).get("value", 0) or 0
-        row["values.infrastructure.markup.units"] = (infra.get("markup", {}) or {}).get("units", self.currency) or self.currency
-        row["values.infrastructure.usage.value"] = (infra.get("usage", {}) or {}).get("value", 0) or 0
-        row["values.infrastructure.usage.units"] = (infra.get("usage", {}) or {}).get("units", self.currency) or self.currency
-        row["values.infrastructure.total.value"] = (infra.get("total", {}) or {}).get("value", 0) or 0
-        row["values.infrastructure.total.units"] = (infra.get("total", {}) or {}).get("units", self.currency) or self.currency
+    @staticmethod
+    def _safe_num(x):
+        try:
+            if x is None:
+                return None
+            return float(x)
+        except Exception:
+            return None
 
-        # Supplementary
-        supp = values_record.get("supplementary", {}) or {}
-        row["values.supplementary.raw.value"] = (supp.get("raw", {}) or {}).get("value", 0) or 0
-        row["values.supplementary.raw.units"] = (supp.get("raw", {}) or {}).get("units", self.currency) or self.currency
-        row["values.supplementary.markup.value"] = (supp.get("markup", {}) or {}).get("value", 0) or 0
-        row["values.supplementary.markup.units"] = (supp.get("markup", {}) or {}).get("units", self.currency) or self.currency
-        row["values.supplementary.usage.value"] = (supp.get("usage", {}) or {}).get("value", 0) or 0
-        row["values.supplementary.usage.units"] = (supp.get("usage", {}) or {}).get("units", self.currency) or self.currency
-        row["values.supplementary.total.value"] = (supp.get("total", {}) or {}).get("value", 0) or 0
-        row["values.supplementary.total.units"] = (supp.get("total", {}) or {}).get("units", self.currency) or self.currency
+    def _flatten_metric(self, metric: Dict[str, Any], prefix: str) -> Dict[str, Any]:
+        """
+        metric exemplo:
+          usage: {value, units}
+          request: {value, units, unused, unused_percent}
+          capacity: {value, units, unused, unused_percent, count, count_units}
+        """
+        out = {}
 
-        # Cost
-        cost = values_record.get("cost", {}) or {}
-        row["values.cost.raw.value"] = (cost.get("raw", {}) or {}).get("value", 0) or 0
-        row["values.cost.raw.units"] = (cost.get("raw", {}) or {}).get("units", self.currency) or self.currency
-        row["values.cost.markup.value"] = (cost.get("markup", {}) or {}).get("value", 0) or 0
-        row["values.cost.markup.units"] = (cost.get("markup", {}) or {}).get("units", self.currency) or self.currency
-        row["values.cost.usage.value"] = (cost.get("usage", {}) or {}).get("value", 0) or 0
-        row["values.cost.usage.units"] = (cost.get("usage", {}) or {}).get("units", self.currency) or self.currency
+        if not isinstance(metric, dict):
+            # preenche campos esperados com None
+            if prefix in ("request", "capacity"):
+                out[f"values.{prefix}.value"] = None
+                out[f"values.{prefix}.units"] = None
+                out[f"values.{prefix}.unused"] = None
+                out[f"values.{prefix}.unused_percent"] = None
+                if prefix == "capacity":
+                    out["values.capacity.count"] = None
+                    out["values.capacity.count_units"] = None
+            else:
+                out[f"values.{prefix}.value"] = None
+                out[f"values.{prefix}.units"] = None
+            return out
 
-        # Project PQ possui também estes campos (se não existir, vira 0)
-        row["values.cost.platform_distributed.value"] = (cost.get("platform_distributed", {}) or {}).get("value", 0) or 0
-        row["values.cost.platform_distributed.units"] = (cost.get("platform_distributed", {}) or {}).get("units", self.currency) or self.currency
-        row["values.cost.worker_unallocated_distributed.value"] = (cost.get("worker_unallocated_distributed", {}) or {}).get("value", 0) or 0
-        row["values.cost.worker_unallocated_distributed.units"] = (cost.get("worker_unallocated_distributed", {}) or {}).get("units", self.currency) or self.currency
-        row["values.cost.distributed.value"] = (cost.get("distributed", {}) or {}).get("value", 0) or 0
-        row["values.cost.distributed.units"] = (cost.get("distributed", {}) or {}).get("units", self.currency) or self.currency
+        out[f"values.{prefix}.value"] = metric.get("value")
+        out[f"values.{prefix}.units"] = metric.get("units")
 
-        row["values.cost.total.value"] = (cost.get("total", {}) or {}).get("value", 0) or 0
-        row["values.cost.total.units"] = (cost.get("total", {}) or {}).get("units", self.currency) or self.currency
+        if prefix in ("request", "capacity"):
+            out[f"values.{prefix}.unused"] = metric.get("unused")
+            out[f"values.{prefix}.unused_percent"] = metric.get("unused_percent")
 
-        # Delta fields
-        if delta_percent_override is not None:
-            row["values.delta_percent"] = delta_percent_override
-        else:
-            row["values.delta_percent"] = values_record.get("delta_percent", 0) or 0
+        if prefix == "capacity":
+            out["values.capacity.count"] = metric.get("count")
+            out["values.capacity.count_units"] = metric.get("count_units")
 
-        if delta_value_override is not None:
-            row["values.delta_value"] = delta_value_override
-        else:
-            row["values.delta_value"] = values_record.get("delta_value", 0) or 0
+        return out
 
-        # key (só tags)
-        row["key"] = tag_key
+    def _extract_group_list(self, day_item: Dict[str, Any], group_by_code: str, tag_key: Optional[str]) -> List[Dict[str, Any]]:
+        """
+        No PQ:
+          - project => day_item["projects"]
+          - cluster => day_item["clusters"]
+          - node   => day_item["nodes"]
+          - tag    => day_item[f"{Key}s"] (ex: "produtos")
+        """
+        if group_by_code == "project":
+            return day_item.get("projects", []) or []
+        if group_by_code == "cluster":
+            return day_item.get("clusters", []) or []
+        if group_by_code == "node":
+            return day_item.get("nodes", []) or []
+        if group_by_code == "tag":
+            plural = f"{tag_key}s" if tag_key else "tags"
+            return day_item.get(plural, []) or []
+        return []
 
-        return row
+    def _get_name_from_group_record(self, group_by_code: str, group_record: Dict[str, Any], tag_key: Optional[str]) -> Optional[str]:
+        if group_by_code == "project":
+            return group_record.get("project")
+        if group_by_code == "cluster":
+            return group_record.get("cluster")
+        if group_by_code == "node":
+            return group_record.get("node")
+        if group_by_code == "tag":
+            # normalmente vem "tag"
+            return group_record.get("tag") or group_record.get(tag_key) or group_record.get("key")
+        return None
 
-    # --------------------------------------------------------------------------
-    # ✅ OS Cost Cluster Projects (já corrigido, mantém)
-    # --------------------------------------------------------------------------
-    def create_os_cost_cluster_projects(self, cluster_project_data: List[Dict[str, Any]]) -> pd.DataFrame:
-        rows = []
-
-        for item in cluster_project_data:
-            date = item.get("date")
-            cluster = item.get("_cluster")
-
-            for project in item.get("projects", []):
-                project_name = project.get("project")
-
-                for value in project.get("values", []):
-                    total = (value.get("cost", {}) or {}).get("total", {}) or {}
-                    total_value = total.get("value", 0) or 0
-
-                    rows.append({
-                        "code": self.currency,
-                        "Group By Code": "cluster",
-                        "cluster": cluster,
-                        "date": pd.to_datetime(date),
-                        "project": project_name,
-                        "value": total_value,
-                        "units": self.currency,
-                        "Filter Month": pd.to_datetime(date).strftime("%Y-%m"),
-                    })
-
-        return pd.DataFrame(rows)
-
-    # --------------------------------------------------------------------------
-    # ✅ OS Cost Project Tags (PQ 100% fiel)
-    # --------------------------------------------------------------------------
-    def create_os_cost_project_tags(
+    def _rows_from_usage_payload(
         self,
-        all_data: Dict[str, Any],
-        client: OpenShiftCostAPIClient,
-        start_date: str,
-        end_date: str,
-    ) -> pd.DataFrame:
-        self.logger.info("Gerando OS Cost Project Tags (Power Query mode)...")
-
-        base_rows = []
-
-        # Power Query: Source = Cost_Data_Master_Projects_Daily
-        # -> select code/date/project
-        # -> date = Date.StartOfMonth
-        # -> distinct
-        for item in all_data.get("project", []):
-            item_date = item.get("date")
-            if not item_date:
-                continue
-
-            # Date.StartOfMonth
-            month_start = pd.to_datetime(item_date).to_period("M").to_timestamp()
-
-            for proj in item.get("projects", []):
-                base_rows.append({
-                    "project": proj.get("project"),
-                    "date": month_start,
-                })
-
-        df_base = (
-            pd.DataFrame(base_rows)
-            .dropna(subset=["project"])
-            .drop_duplicates(subset=["project", "date"])
-        )
-
-        rows = []
-
-        # PQ: Invoked Custom Function get_no_loop_data(filter[project]=...)
-        for _, r in df_base.iterrows():
-            proj = r["project"]
-            month_start = r["date"]
-
-            tag_data = client.get_project_tags_by_project(proj, start_date, end_date)
-
-            for tag in tag_data:
-                tag_key = tag.get("key")
-                enabled = tag.get("enabled", True)
-
-                for val in tag.get("values", []) or []:
-                    rows.append({
-                        "code": self.currency,
-                        "date": month_start,
-                        "project": proj,
-                        "key": tag_key,
-                        "values": val,
-                        "enabled": enabled,
-                        "Filter Month": month_start.strftime("%Y-%m"),
-                    })
-
-        return pd.DataFrame(rows)
-
-    # --------------------------------------------------------------------------
-    # ✅ OS Costs Daily (Power Query fiel)
-    # Table.Combine({Projects, Clusters, Nodes, Tags})
-    # --------------------------------------------------------------------------
-    def create_os_costs_daily(self, all_data: Dict[str, Any]) -> pd.DataFrame:
-        self.logger.info("Gerando OS Costs Daily (Power Query Table.Combine mode)...")
+        payload: Dict[str, Any],
+        group_by_label: str,
+        group_by_code: str,
+        usage_code: str,
+        usage_name: str,
+        key: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        meta = payload.get("meta", {}) or {}
+        meta_count = meta.get("count", None)
+        meta_currency = meta.get("currency", self.currency)
 
         rows: List[Dict[str, Any]] = []
 
-        # -----------------------------
-        # Projects Daily
-        # -----------------------------
-        for item in all_data.get("project", []):
-            date = item.get("date")
-            if not date:
+        for day_item in payload.get("data", []) or []:
+            date_str = day_item.get("date")
+            if not date_str:
                 continue
+            date_val = pd.to_datetime(date_str).date()
 
-            for proj in item.get("projects", []):
-                proj_name = proj.get("project") or ""
-                for values_record in proj.get("values", []) or []:
-                    row = self._flatten_values_record(
-                        values_record=values_record,
-                        group_by_code="project",
-                        name=proj_name,
-                        date=date,
-                        tag_key=None,
-                        delta_value_override=values_record.get("delta_value", 0),
-                        delta_percent_override=values_record.get("delta_percent", 0),
-                    )
-                    row["Filter Month"] = pd.to_datetime(date).strftime("%Y-%m")
+            group_list = self._extract_group_list(day_item, group_by_code, key)
+
+            for group_record in group_list:
+                name = self._get_name_from_group_record(group_by_code, group_record, key)
+                if name is None:
+                    continue
+
+                values_list = group_record.get("values", []) or []
+                for v in values_list:
+                    # cada v contém usage/request/limit/capacity
+                    row = {
+                        "Group By": group_by_label,
+                        "Group By Code": group_by_code,
+                        "Usage Code": usage_code,
+                        "Usage Name": usage_name,
+                        "Key": key if group_by_code == "tag" else None,
+                        "meta.count": meta_count,
+                        "meta.currency": meta_currency,
+                        "date": pd.to_datetime(date_val),
+                        "Name": name,
+                    }
+                    row.update(self._flatten_metric(v.get("usage"), "usage"))
+                    row.update(self._flatten_metric(v.get("request"), "request"))
+                    row.update(self._flatten_metric(v.get("limit"), "limit"))
+                    row.update(self._flatten_metric(v.get("capacity"), "capacity"))
+
                     rows.append(row)
 
-        # -----------------------------
-        # Clusters Daily
-        # -----------------------------
-        for item in all_data.get("cluster", []):
-            date = item.get("date")
-            if not date:
-                continue
+        return rows
 
-            for cluster in item.get("clusters", []):
-                cluster_name = cluster.get("cluster") or ""
-                for values_record in cluster.get("values", []) or []:
-                    row = self._flatten_values_record(
-                        values_record=values_record,
-                        group_by_code="cluster",
-                        name=cluster_name,
-                        date=date,
-                        tag_key=None,
-                    )
-                    row["Filter Month"] = pd.to_datetime(date).strftime("%Y-%m")
-                    rows.append(row)
+    def create_os_daily_usage(
+        self,
+        client: OpenShiftCostAPIClient,
+        start_date: str,
+        end_date: str,
+        usage_codes: List[str],
+        tag_keys: List[str],
+    ) -> pd.DataFrame:
+        self.logger.info("Gerando OS Daily Usage (Power Query mode)...")
 
-        # -----------------------------
-        # Nodes Daily
-        # -----------------------------
-        for item in all_data.get("node", []):
-            date = item.get("date")
-            if not date:
-                continue
+        group_bys = [
+            ("Project", "project"),
+            ("Cluster", "cluster"),
+            ("Node", "node"),
+            ("Tag", "tag"),
+        ]
 
-            for cluster in item.get("clusters", []):
-                for node in cluster.get("nodes", []) or []:
-                    node_name = node.get("node") or ""
-                    for values_record in node.get("values", []) or []:
-                        row = self._flatten_values_record(
-                            values_record=values_record,
-                            group_by_code="node",
-                            name=node_name,
-                            date=date,
-                            tag_key=None,
+        all_rows: List[Dict[str, Any]] = []
+
+        for usage_code in usage_codes:
+            usage_name = self.USAGE_CODE_NAME.get(usage_code, usage_code)
+
+            for group_label, group_code in group_bys:
+                if group_code == "tag":
+                    for k in tag_keys:
+                        payload = client.get_usage_report(
+                            usage_code=usage_code,
+                            start_date=start_date,
+                            end_date=end_date,
+                            group_by_code="tag",
+                            tag_key=k,
+                            limit=200,
                         )
-                        row["Filter Month"] = pd.to_datetime(date).strftime("%Y-%m")
-                        rows.append(row)
-
-        # -----------------------------
-        # Tags Daily (⚠️ aqui é onde mais dá divergência)
-        # PQ faz renome dinâmico do campo da tag → Name
-        # e mantém coluna key
-        # -----------------------------
-        tag_key_name = all_data.get("_tag_key_name", "produto")
-        for item in all_data.get("tag", []):
-            date = item.get("date")
-            if not date:
-                continue
-
-            # API geralmente devolve algo como item["produtos"] (plural)
-            possible_lists = [
-                item.get(f"{tag_key_name}s"),  # ex: produtos
-                item.get("tags"),              # fallback
-            ]
-            tags_list = None
-            for lst in possible_lists:
-                if isinstance(lst, list):
-                    tags_list = lst
-                    break
-            if not tags_list:
-                continue
-
-            for tag_entry in tags_list:
-                # o "nome da tag" pode vir em várias chaves dependendo do endpoint:
-                # produto, tag, key, value...
-                tag_name = (
-                    tag_entry.get(tag_key_name)
-                    or tag_entry.get("tag")
-                    or tag_entry.get("value")
-                    or tag_entry.get("key")
-                    or ""
-                )
-
-                for values_record in tag_entry.get("values", []) or []:
-                    row = self._flatten_values_record(
-                        values_record=values_record,
-                        group_by_code="tag",
-                        name=tag_name,
-                        date=date,
-                        tag_key=tag_key_name,  # PQ: coluna 'key'
-                        delta_value_override=values_record.get("delta_value", 0),
-                        delta_percent_override=values_record.get("delta_percent", 0),
+                        all_rows.extend(
+                            self._rows_from_usage_payload(
+                                payload,
+                                group_by_label=group_label,
+                                group_by_code="tag",
+                                usage_code=usage_code,
+                                usage_name=usage_name,
+                                key=k,
+                            )
+                        )
+                else:
+                    payload = client.get_usage_report(
+                        usage_code=usage_code,
+                        start_date=start_date,
+                        end_date=end_date,
+                        group_by_code=group_code,
+                        tag_key=None,
+                        limit=200,
                     )
-                    row["Filter Month"] = pd.to_datetime(date).strftime("%Y-%m")
-                    rows.append(row)
+                    all_rows.extend(
+                        self._rows_from_usage_payload(
+                            payload,
+                            group_by_label=group_label,
+                            group_by_code=group_code,
+                            usage_code=usage_code,
+                            usage_name=usage_name,
+                            key=None,
+                        )
+                    )
 
-        df = pd.DataFrame(rows)
+        df = pd.DataFrame(all_rows)
 
-        # (Opcional defensivo) garantir colunas mínimas mesmo se alguma fonte vier vazia
-        if df.empty:
-            df = pd.DataFrame(columns=[
-                "code", "Group By Code", "meta.distributed_overhead", "date", "Name",
-                "values.date", "values.classification", "values.source_uuid", "values.clusters",
-                "values.infrastructure.raw.value", "values.infrastructure.raw.units",
-                "values.infrastructure.markup.value", "values.infrastructure.markup.units",
-                "values.infrastructure.usage.value", "values.infrastructure.usage.units",
-                "values.infrastructure.total.value", "values.infrastructure.total.units",
-                "values.supplementary.raw.value", "values.supplementary.raw.units",
-                "values.supplementary.markup.value", "values.supplementary.markup.units",
-                "values.supplementary.usage.value", "values.supplementary.usage.units",
-                "values.supplementary.total.value", "values.supplementary.total.units",
-                "values.cost.raw.value", "values.cost.raw.units",
-                "values.cost.markup.value", "values.cost.markup.units",
-                "values.cost.usage.value", "values.cost.usage.units",
-                "values.cost.platform_distributed.value", "values.cost.platform_distributed.units",
-                "values.cost.worker_unallocated_distributed.value", "values.cost.worker_unallocated_distributed.units",
-                "values.cost.distributed.value", "values.cost.distributed.units",
-                "values.cost.total.value", "values.cost.total.units",
-                "values.delta_value", "values.delta_percent",
-                "key", "Filter Month",
-            ])
+        # garante todas colunas do template e ordem
+        for c in self.TEMPLATE_COLUMNS:
+            if c not in df.columns:
+                df[c] = None
+        df = df[self.TEMPLATE_COLUMNS]
+
+        # tipos (como o PQ faz "Changed Type")
+        # não forçar demais pra não quebrar dados vazios, mas garantir numéricos onde faz sentido
+        numeric_cols = [
+            "values.usage.value",
+            "values.request.value",
+            "values.request.unused",
+            "values.request.unused_percent",
+            "values.limit.value",
+            "values.capacity.value",
+            "values.capacity.unused",
+            "values.capacity.unused_percent",
+            "values.capacity.count",
+        ]
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
 
         return df
 
-    # --------------------------------------------------------------------------
-    # GERA EXCEL (estrutura preservada)
-    # --------------------------------------------------------------------------
-    def format_to_excel(
-        self,
-        all_data: Dict[str, Any],
-        cluster_project_data: List[Dict[str, Any]],
-        output_file: str,
-        start_date: str,
-        end_date: str,
-        tags: List[Dict[str, Any]],
-        client: OpenShiftCostAPIClient,
-    ):
-        self.logger.info("Formatando dados para Excel...")
-
+    def write_excel(self, df_usage: pd.DataFrame, output_file: str):
+        # workbook com UMA aba visível => evita erro openpyxl
         with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
-            # Data_Period (estrutura original preservada)
-            df_period = pd.DataFrame({
-                "Start Date": ["Start Date", start_date, None, None, None],
-                "End Date": ["End Date", end_date, None, None, None],
-                "Col3": [None, None, None, None, None],
-                "Col4": [None, None, None, None, None],
-                "Col5": [None, None, None, None, None],
-                "Col6": [None, None, None, None, None],
-                "Col7": [None, None, None, None, None],
-                "Guidelines": [
-                    None,
-                    "Guidelines",
-                    "Enter start and end dates from the same month.",
-                    "If the need is to get data from multiple months, make copies of the file to ensure start and end date are from the same month.",
-                    "The date range should be no earlier to 4 months prior to the current month.",
-                ],
-            })
-            df_period.to_excel(writer, sheet_name="Data_Period", index=False, header=False)
+            df_usage.to_excel(writer, sheet_name="OS Daily Usage", index=False)
 
-            # Default Master Settings
-            df_settings = pd.DataFrame({
-                "code": ["BRL"],
-                "name": ["Brazilian Real"],
-                "symbol": ["R$"],
-                "description": ["BRL (R$) - Brazilian Real"],
-                "Default_Configurations.data.currency": ["BRL"],
-                "Default_Configurations.data.cost_type": ["calculated_amortized_cost"],
-            })
-            df_settings.to_excel(writer, sheet_name="Default Master Settings", index=False)
-
-            # Project Overhead Cost Types
-            df_cost_types = pd.DataFrame({
-                "Code": ["cost", "distributed_cost"],
-                "Description": ["Don't distribute overhead costs", "Distribute through cost models"],
-            })
-            df_cost_types.to_excel(writer, sheet_name="Project Overhead Cost Types", index=False)
-
-            # OpenShift Group Bys
-            df_group_bys = pd.DataFrame({
-                "Group By": ["Cluster", "Node", "Project", "Tag"],
-                "Group By Code": ["cluster", "node", "project", "tag"],
-            })
-            df_group_bys.to_excel(writer, sheet_name="OpenShift Group Bys", index=False)
-
-            # OS Tag Keys (estrutura preservada)
-            tag_data = []
-            for t in tags:
-                tag_data.append({"count": 1, "key": t.get("key", "produto"), "enabled": True, "Group By": "tag"})
-            if not tag_data:
-                tag_data = [{"count": 1, "key": "produto", "enabled": True, "Group By": "tag"}]
-            pd.DataFrame(tag_data).to_excel(writer, sheet_name="OS Tag Keys", index=False)
-
-            # OS Cost Cluster Projects (CORRIGIDO)
-            self.create_os_cost_cluster_projects(cluster_project_data).to_excel(
-                writer, sheet_name="OS Cost Cluster Projects", index=False
-            )
-
-            # OS Cost Project Tags (CORRIGIDO)
-            self.create_os_cost_project_tags(all_data, client, start_date, end_date).to_excel(
-                writer, sheet_name="OS Cost Project Tags", index=False
-            )
-
-            # OS Costs Daily (CORRIGIDO)
-            self.create_os_costs_daily(all_data).to_excel(
-                writer, sheet_name="OS Costs Daily", index=False
-            )
-
-        self.logger.info(f"Excel gerado com sucesso: {output_file}")
-
-
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # MAIN
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="OpenShift Cost Management - Extrator de Dados (PQ MODE)")
-    parser.add_argument("--start-date", type=str, help="Data inicial (YYYY-MM-DD)", default=None)
-    parser.add_argument("--end-date", type=str, help="Data final (YYYY-MM-DD)", default=None)
-    parser.add_argument("--output", type=str, help="Arquivo de saída", default="openshift_costs.xlsx")
-    parser.add_argument("--currency", type=str, help="Moeda", default="BRL")
+    parser = argparse.ArgumentParser(description="Gerar somente a aba OS Daily Usage")
+    parser.add_argument("--start-date", type=str, required=False, default=None, help="YYYY-MM-DD")
+    parser.add_argument("--end-date", type=str, required=False, default=None, help="YYYY-MM-DD")
+    parser.add_argument("--output", type=str, required=False, default="openshift_daily_usage.xlsx")
+    parser.add_argument("--currency", type=str, required=False, default="BRL")
+    parser.add_argument(
+        "--usage-codes",
+        type=str,
+        required=False,
+        default="compute,memory,volumes",
+        help="Lista separada por vírgula. Ex: compute,memory,volumes",
+    )
     args = parser.parse_args()
 
     if not args.end_date:
         args.end_date = datetime.now().strftime("%Y-%m-%d")
     if not args.start_date:
-        args.start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        args.start_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
 
-    logger.info("Iniciando extração de dados do OpenShift Cost Management")
+    usage_codes = [u.strip() for u in (args.usage_codes or "").split(",") if u.strip()]
+    if not usage_codes:
+        usage_codes = ["compute", "memory", "volumes"]
+
+    logger.info("Iniciando extração OS Daily Usage")
     logger.info(f"Período: {args.start_date} a {args.end_date}")
-    logger.info(f"Moeda: {args.currency}")
+    logger.info(f"Usage Codes: {', '.join(usage_codes)}")
 
     try:
         config = APIConfig()
         client = OpenShiftCostAPIClient(config, logger)
 
-        all_data = client.get_costs_by_groupby(args.start_date, args.end_date, args.currency)
-        cluster_project_data = client.get_cluster_project_costs(args.start_date, args.end_date, args.currency)
-        tags = client.get_tags()
+        # Tag keys (PQ: merge com Cost_Tag_Keys)
+        tag_keys = client.get_tag_keys()
 
-        formatter = ExcelFormatterFixed(logger, args.currency)
-        formatter.format_to_excel(
-            all_data=all_data,
-            cluster_project_data=cluster_project_data,
-            output_file=args.output,
+        formatter = ExcelDailyUsageFormatter(logger, currency=args.currency)
+        df_usage = formatter.create_os_daily_usage(
+            client=client,
             start_date=args.start_date,
             end_date=args.end_date,
-            tags=tags,
-            client=client,  # ✅ agora existe e não dá NameError
+            usage_codes=usage_codes,
+            tag_keys=tag_keys,
         )
 
-        logger.info("Processo concluído com sucesso!")
+        formatter.write_excel(df_usage, args.output)
+        logger.info(f"Excel gerado com sucesso: {args.output}")
+
     except Exception as e:
         logger.error(f"Erro durante a execução: {e}", exc_info=True)
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()

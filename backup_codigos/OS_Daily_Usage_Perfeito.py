@@ -456,7 +456,7 @@ def main():
     parser = argparse.ArgumentParser(description="Gerar somente a aba OS Daily Usage")
     parser.add_argument("--start-date", type=str, required=False, default=None, help="YYYY-MM-DD")
     parser.add_argument("--end-date", type=str, required=False, default=None, help="YYYY-MM-DD")
-    parser.add_argument("--output", type=str, required=False, default="openshift_daily_usage.xlsx")
+    parser.add_argument("--output", type=str, required=False, default="OpenShift_Daily_Usage.xlsx")
     parser.add_argument("--currency", type=str, required=False, default="BRL")
     parser.add_argument(
         "--usage-codes",
